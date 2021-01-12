@@ -1,11 +1,14 @@
 package sethandler
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -24,10 +27,10 @@ import (
 )
 
 var (
-	resourceBaseName 		= "nokia.k8s.io"
-	processConfigKey 		= resourceBaseName + "/cpus"
+	resourceBaseName       = "nokia.k8s.io"
+	processConfigKey       = resourceBaseName + "/cpus"
 	setterAnnotationSuffix = "cpusets-configured"
-	setterAnnotationKey		= resourceBaseName + "/" + setterAnnotationSuffix
+	setterAnnotationKey    = resourceBaseName + "/" + setterAnnotationSuffix
 )
 
 type checkpointPodDevicesEntry struct {
@@ -105,7 +108,7 @@ func (setHandler *SetHandler) PodAdded(pod v1.Pod) {
 	}
 	containersToBeSet := gatherAllContainers(pod)
 	if len(containersToBeSet) > 0 {
-			setHandler.adjustContainerSets(pod, containersToBeSet)
+		setHandler.adjustContainerSets(pod, containersToBeSet)
 	}
 }
 
@@ -192,7 +195,7 @@ func (setHandler *SetHandler) adjustContainerSets(pod v1.Pod, containersToBeSet 
 		log.Printf("ERROR: Cpuset for the infracontainer of Pod: %s with ID: %s could not be re-adjusted, because: %s", pod.ObjectMeta.Name, pod.ObjectMeta.UID, err)
 		return
 	}
-	err = k8sclient.SetPodAnnotation(pod, resourceBaseName + "~1" + setterAnnotationSuffix, "true")
+	err = k8sclient.SetPodAnnotation(pod, resourceBaseName+"~1"+setterAnnotationSuffix, "true")
 	if err != nil {
 		log.Printf("ERROR: %s ID: %s  annontation cannot update, because: %s", pod.ObjectMeta.Name, pod.ObjectMeta.UID, err)
 	}
@@ -212,12 +215,17 @@ func (setHandler *SetHandler) determineCorrectCpuset(pod v1.Pod, container v1.Co
 			if err != nil {
 				return cpuset.CPUSet{}, err
 			}
+			if setHandler.poolConfig.SelectPool(resNameAsString).HTPolicy == types.MultiThreadHTPolicy {
+				exclusiveCPUSet, err = addHTtSiblingsToCpuSet(exclusiveCPUSet)
+				if err != nil {
+					return cpuset.CPUSet{}, err
+				}
+			}
 		}
 	}
 	if !sharedCPUSet.IsEmpty() || !exclusiveCPUSet.IsEmpty() {
 		return sharedCPUSet.Union(exclusiveCPUSet), nil
 	}
-
 	return setHandler.poolConfig.SelectPool(types.DefaultPoolID).CPUs, nil
 }
 
@@ -229,12 +237,10 @@ func (setHandler *SetHandler) getListOfAllocatedExclusiveCpus(exclusivePoolName 
 		log.Printf("Error reading file %s: Error: %v", checkpointFileName, err)
 		return cpuset.CPUSet{}, fmt.Errorf("kubelet checkpoint file could not be accessed because: %s", err)
 	}
-
 	if err = json.Unmarshal(buf, &cp); err != nil {
 		log.Printf("error unmarshalling kubelet checkpoint file: %s", err)
 		return cpuset.CPUSet{}, err
 	}
-
 	podIDStr := string(pod.ObjectMeta.UID)
 	deviceIDs := []string{}
 	for _, entry := range cp.Data.PodDeviceEntries {
@@ -248,6 +254,49 @@ func (setHandler *SetHandler) getListOfAllocatedExclusiveCpus(exclusivePoolName 
 		return cpuset.CPUSet{}, nil
 	}
 	return calculateFinalExclusiveSet(deviceIDs, pod, container)
+}
+
+func addHTtSiblingsToCpuSet(exclusiveCpuSet cpuset.CPUSet) (cpuset.CPUSet, error) {
+	cmd := exec.Command("lscpu", "-p=cpu,core")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	if err != nil {
+		return exclusiveCpuSet, errors.New("could not interrogate the hyperthreading topology of the node, because:" + err.Error())
+	}
+	outStr := string(stdout.Bytes())
+	//First, we parse the output and build up a physical core ID->list of logical cores belonging to same phys core association
+	coreMap := make(map[int]string)
+	for _, lsLine := range strings.Split(strings.TrimSuffix(outStr, "\n"), "\n") {
+		cpuInfoStr := strings.Split(lsLine, ",")
+		if len(cpuInfoStr) != 2 {
+			continue
+		}
+		logicalCoreId, logicErr := strconv.Atoi(cpuInfoStr[0])
+		physicalCoreId, physErr := strconv.Atoi(cpuInfoStr[1])
+		if logicErr != nil || physErr != nil {
+			continue
+		}
+		//We don't want to duplicate the physical core itself into the logical core ID list
+		if physicalCoreId != logicalCoreId {
+			if coreMap[physicalCoreId] != "" {
+				coreMap[physicalCoreId] += ","
+			}
+			coreMap[physicalCoreId] += cpuInfoStr[1]
+		}
+	}
+	//Then, we expand the exclusive CPU set with all the logical siblings of the physical cores already added to the set
+	for _, coreId := range exclusiveCpuSet.ToSlice() {
+		if coreMap[coreId] == "" {
+			continue
+		}
+		logicalSet, err := cpuset.Parse(coreMap[coreId])
+		if err != nil {
+			return exclusiveCpuSet, errors.New("WARNING: adjusting the exclusive CPU set with HT siblings went wrong because:" + err.Error())
+		}
+		exclusiveCpuSet.Union(logicalSet)
+	}
+	return exclusiveCpuSet, nil
 }
 
 func calculateFinalExclusiveSet(exclusiveCpus []string, pod v1.Pod, container v1.Container) (cpuset.CPUSet, error) {
@@ -287,7 +336,7 @@ func (setHandler *SetHandler) applyCpusetToContainer(containerID string, cpuset 
 		log.Printf("WARNING: for some reason cpuset to set was quite empty for container: %s.I left it untouched.", containerID)
 		return "", nil
 	}
-	//According to K8s documentation CID is stored in "docker://<container_id>" format
+	//According to K8s documentation CID is stored in "docker://<container_id>" format when dockershim is configured for CRE
 	trimmedCid := strings.TrimPrefix(containerID, "docker://")
 	var pathToContainerCpusetFile string
 	filepath.Walk(setHandler.cpusetRoot, func(path string, f os.FileInfo, err error) error {
@@ -309,7 +358,7 @@ func (setHandler *SetHandler) applyCpusetToContainer(containerID string, cpuset 
 		}
 		return nil
 	})
-	file, err := os.OpenFile(pathToContainerCpusetFile + "/cpuset.cpus", os.O_WRONLY|os.O_SYNC, 0755)
+	file, err := os.OpenFile(pathToContainerCpusetFile+"/cpuset.cpus", os.O_WRONLY|os.O_SYNC, 0755)
 	if err != nil {
 		return "", fmt.Errorf("can't open cpuset file: %s for container: %s because: %s", pathToContainerCpusetFile, containerID, err)
 	}
